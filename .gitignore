@@ -188,4 +188,5 @@ compile_commands.json
 
 # Include compiled Vulkan shaders if CMake does not compile them
 !*.spv
-
+# Generated compiled Vulkan shaders
+Shaders/*.spv

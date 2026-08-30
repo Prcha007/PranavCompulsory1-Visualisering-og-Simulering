@@ -15,6 +15,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <cstddef>
+#include <fstream>
+#include <limits>
 #include "Logger.h"
 #include "MainWindow.h"
 
@@ -28,6 +31,32 @@
 #include <vulkan/vulkan_metal.h>
 #include <objc/objc.h>
 #endif
+
+VkVertexInputBindingDescription PointVertex::getBindingDescription()
+{
+    VkVertexInputBindingDescription description{};
+    description.binding = 0;
+    description.stride = sizeof(PointVertex);
+    description.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    return description;
+}
+
+std::array<VkVertexInputAttributeDescription, 2> PointVertex::getAttributeDescriptions()
+{
+    std::array<VkVertexInputAttributeDescription, 2> descriptions{};
+
+    descriptions[0].binding = 0;
+    descriptions[0].location = 0;
+    descriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+    descriptions[0].offset = offsetof(PointVertex, position);
+
+    descriptions[1].binding = 0;
+    descriptions[1].location = 1;
+    descriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+    descriptions[1].offset = offsetof(PointVertex, color);
+
+    return descriptions;
+}
 
 Renderer::Renderer(QWindow* parent) : QWindow(parent), mLogger(Logger::getInstance())
 {
@@ -51,6 +80,8 @@ void Renderer::initVulkan()
     createSurface();
     pickPhysicalDevice();
     createLogicalDevice();
+    loadPointCloud(PATH + "laz_text.txt");
+    createPointVertexBuffer();
     createSwapChain();
     createImageViews();
     createRenderPass();
@@ -59,6 +90,156 @@ void Renderer::initVulkan()
     createCommandPool();
     createCommandBuffers();
     createSyncObjects();
+}
+
+void Renderer::loadPointCloud(const std::string& filename)
+{
+    std::ifstream file(filename);
+    if (!file.is_open())
+        throw std::runtime_error("failed to open point-cloud file: " + filename);
+
+    std::size_t declaredPointCount = 0;
+    if (!(file >> declaredPointCount) || declaredPointCount == 0)
+        throw std::runtime_error("invalid point count in point-cloud file");
+
+    struct SourcePoint
+    {
+        double x;
+        double y;
+        double z;
+    };
+
+    std::vector<SourcePoint> sourcePoints;
+    sourcePoints.reserve(declaredPointCount);
+
+    double minX = std::numeric_limits<double>::max();
+    double minY = std::numeric_limits<double>::max();
+    double minZ = std::numeric_limits<double>::max();
+    double maxX = std::numeric_limits<double>::lowest();
+    double maxY = std::numeric_limits<double>::lowest();
+    double maxZ = std::numeric_limits<double>::lowest();
+
+    for (std::size_t i = 0; i < declaredPointCount; ++i)
+    {
+        SourcePoint point{};
+        if (!(file >> point.x >> point.y >> point.z))
+            throw std::runtime_error("point-cloud file ended before the declared point count");
+
+        sourcePoints.push_back(point);
+        minX = std::min(minX, point.x);
+        minY = std::min(minY, point.y);
+        minZ = std::min(minZ, point.z);
+        maxX = std::max(maxX, point.x);
+        maxY = std::max(maxY, point.y);
+        maxZ = std::max(maxZ, point.z);
+    }
+
+    const double centerX = (minX + maxX) * 0.5;
+    const double centerY = (minY + maxY) * 0.5;
+    const double horizontalSize = std::max(maxX - minX, maxY - minY);
+    const double scale = horizontalSize > 0.0 ? 20.0 / horizontalSize : 1.0;
+    const double elevationRange = std::max(maxZ - minZ, 1.0);
+
+    pointVertices.clear();
+    pointVertices.reserve(sourcePoints.size());
+
+    for (const SourcePoint& point : sourcePoints)
+    {
+        PointVertex vertex{};
+
+        // Geographic X remains X. Geographic elevation Z becomes Vulkan Y.
+        // Geographic Y becomes negative Vulkan Z because this renderer is Y-up.
+        vertex.position = glm::vec3(
+            static_cast<float>((point.x - centerX) * scale),
+            static_cast<float>((point.z - minZ) * scale),
+            static_cast<float>(-(point.y - centerY) * scale));
+
+        const float height = static_cast<float>((point.z - minZ) / elevationRange);
+        vertex.color = glm::vec3(
+            0.10f + 0.80f * height,
+            0.35f + 0.55f * height,
+            0.95f - 0.70f * height);
+
+        pointVertices.push_back(vertex);
+    }
+
+    LOGP("Loaded %u terrain points", static_cast<unsigned int>(pointVertices.size()));
+}
+
+void Renderer::createPointVertexBuffer()
+{
+    if (pointVertices.empty())
+        throw std::runtime_error("cannot create an empty point-cloud vertex buffer");
+
+    const VkDeviceSize bufferSize =
+        sizeof(PointVertex) * static_cast<VkDeviceSize>(pointVertices.size());
+
+    createBuffer(
+        bufferSize,
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        pointVertexBuffer,
+        pointVertexBufferMemory);
+
+    void* mappedMemory = nullptr;
+    if (vkMapMemory(device, pointVertexBufferMemory, 0, bufferSize, 0, &mappedMemory) != VK_SUCCESS)
+        throw std::runtime_error("failed to map point-cloud vertex-buffer memory");
+
+    std::memcpy(mappedMemory, pointVertices.data(), static_cast<std::size_t>(bufferSize));
+    vkUnmapMemory(device, pointVertexBufferMemory);
+}
+
+void Renderer::createBuffer(
+    VkDeviceSize size,
+    VkBufferUsageFlags usage,
+    VkMemoryPropertyFlags properties,
+    VkBuffer& buffer,
+    VkDeviceMemory& bufferMemory)
+{
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.usage = usage;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS)
+        throw std::runtime_error("failed to create point-cloud vertex buffer");
+
+    VkMemoryRequirements memoryRequirements{};
+    vkGetBufferMemoryRequirements(device, buffer, &memoryRequirements);
+
+    VkMemoryAllocateInfo allocationInfo{};
+    allocationInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocationInfo.allocationSize = memoryRequirements.size;
+    allocationInfo.memoryTypeIndex = findMemoryType(
+        memoryRequirements.memoryTypeBits,
+        properties);
+
+    if (vkAllocateMemory(device, &allocationInfo, nullptr, &bufferMemory) != VK_SUCCESS)
+        throw std::runtime_error("failed to allocate point-cloud vertex-buffer memory");
+
+    if (vkBindBufferMemory(device, buffer, bufferMemory, 0) != VK_SUCCESS)
+        throw std::runtime_error("failed to bind point-cloud vertex-buffer memory");
+}
+
+uint32_t Renderer::findMemoryType(
+    uint32_t typeFilter,
+    VkMemoryPropertyFlags properties)
+{
+    VkPhysicalDeviceMemoryProperties memoryProperties{};
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memoryProperties);
+
+    for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i)
+    {
+        const bool supported = (typeFilter & (1u << i)) != 0;
+        const bool hasProperties =
+            (memoryProperties.memoryTypes[i].propertyFlags & properties) == properties;
+
+        if (supported && hasProperties)
+            return i;
+    }
+
+    throw std::runtime_error("failed to find suitable Vulkan memory type");
 }
 
 void Renderer::cleanupSwapChain()
@@ -79,6 +260,12 @@ void Renderer::cleanupSwapChain()
 void Renderer::cleanup()
 {
     cleanupSwapChain();
+
+    if (pointVertexBuffer != VK_NULL_HANDLE)
+        vkDestroyBuffer(device, pointVertexBuffer, nullptr);
+
+    if (pointVertexBufferMemory != VK_NULL_HANDLE)
+        vkFreeMemory(device, pointVertexBufferMemory, nullptr);
 
     vkDestroyPipeline(device, graphicsPipeline, nullptr);
     vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
@@ -107,8 +294,8 @@ void Renderer::recreateSwapChain() {
     int width = 0, height = 0;
     // glfwGetFramebufferSize(window, &width, &height);
     // while (width == 0 || height == 0) {
-        // glfwGetFramebufferSize(window, &width, &height);
-        // glfwWaitEvents();
+    // glfwGetFramebufferSize(window, &width, &height);
+    // glfwWaitEvents();
     // }
 
     vkDeviceWaitIdle(device);
@@ -253,9 +440,9 @@ void Renderer::pickPhysicalDevice()
         vkGetPhysicalDeviceProperties(device, &deviceProperties);
         LOGP("Physical Device No.%d, Name: %s", i, deviceProperties.deviceName);
         LOGP("   - Max Vulkan API support: %u.%u.%u",
-               VK_VERSION_MAJOR(deviceProperties.apiVersion),
-               VK_VERSION_MINOR(deviceProperties.apiVersion),
-               VK_VERSION_PATCH(deviceProperties.apiVersion));
+             VK_VERSION_MAJOR(deviceProperties.apiVersion),
+             VK_VERSION_MINOR(deviceProperties.apiVersion),
+             VK_VERSION_PATCH(deviceProperties.apiVersion));
 
         if (isDeviceSuitable(device))
             LOGP("   - %s is a suitable device!", deviceProperties.deviceName);
@@ -326,9 +513,9 @@ void Renderer::createLogicalDevice()
     }
 
     if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &device) != VK_SUCCESS)
-        throw std::runtime_error("failed to create logical device!");  
+        throw std::runtime_error("failed to create logical device!");
     else
-       LOG("Created logical device");
+        LOG("Created logical device");
 
     vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
     vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
@@ -496,14 +683,20 @@ void Renderer::createGraphicsPipeline()
 
     VkPipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
 
+    const auto bindingDescription = PointVertex::getBindingDescription();
+    const auto attributeDescriptions = PointVertex::getAttributeDescriptions();
+
     VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
     vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInputInfo.vertexBindingDescriptionCount = 0;
-    vertexInputInfo.vertexAttributeDescriptionCount = 0;
+    vertexInputInfo.vertexBindingDescriptionCount = 1;
+    vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
+    vertexInputInfo.vertexAttributeDescriptionCount =
+        static_cast<uint32_t>(attributeDescriptions.size());
+    vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
     inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
     inputAssembly.primitiveRestartEnable = VK_FALSE;
 
     VkPipelineViewportStateCreateInfo viewportState{};
@@ -517,7 +710,7 @@ void Renderer::createGraphicsPipeline()
     rasterizer.rasterizerDiscardEnable = VK_FALSE;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;  // VK_POLYGON_MODE_FILL, VK_POLYGON_MODE_LINE, VK_POLYGON_MODE_POINT
     rasterizer.lineWidth = 1.0f;                    // set to wider lines if using VK_POLYGON_MODE_LINE
-    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;    // VK_CULL_MODE_BACK_BIT, VK_CULL_MODE_FRONT_BIT, VK_CULL_MODE_NONE
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE; // VK_FRONT_FACE_COUNTER_CLOCKWISE
     rasterizer.depthBiasEnable = VK_FALSE;
 
@@ -553,7 +746,14 @@ void Renderer::createGraphicsPipeline()
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
     pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pipelineLayoutInfo.setLayoutCount = 0;
-    pipelineLayoutInfo.pushConstantRangeCount = 0;
+
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = sizeof(PushConstants);
+
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
 
     if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS)
         throw std::runtime_error("failed to create pipeline layout!");
@@ -663,30 +863,73 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
 
     vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
 
-        VkViewport viewport{};
-        viewport.x = 0.0f;
-        viewport.y = 0.0f;
-        viewport.width = (float) swapChainExtent.width;
-        viewport.height = (float) swapChainExtent.height;
-        viewport.minDepth = 0.0f;
-        viewport.maxDepth = 1.0f;
-        vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = (float) swapChainExtent.width;
+    viewport.height = (float) swapChainExtent.height;
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
 
-        VkRect2D scissor{};
-        scissor.offset = {0, 0};
-        scissor.extent = swapChainExtent;
-        vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = swapChainExtent;
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+    VkBuffer vertexBuffers[] = {pointVertexBuffer};
+    VkDeviceSize offsets[] = {0};
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+
+    const float aspectRatio =
+        static_cast<float>(swapChainExtent.width) /
+        static_cast<float>(swapChainExtent.height);
+
+    // Camera positioned above and in front of the normalized terrain.
+    const glm::vec3 cameraPosition(0.0f, 14.0f, 24.0f);
+    const glm::vec3 cameraTarget(0.0f, 2.5f, 0.0f);
+    const glm::vec3 cameraUp(0.0f, 1.0f, 0.0f);
+
+    const glm::mat4 view = glm::lookAt(
+        cameraPosition,
+        cameraTarget,
+        cameraUp);
+
+    glm::mat4 projection = glm::perspective(
+        glm::radians(45.0f),
+        aspectRatio,
+        0.1f,
+        100.0f);
+
+    // GLM uses an inverted Y convention compared with Vulkan clip space.
+    projection[1][1] *= -1.0f;
+
+    PushConstants pushConstants{};
+    pushConstants.viewProjection = projection * view;
+
+    vkCmdPushConstants(
+        commandBuffer,
+        pipelineLayout,
+        VK_SHADER_STAGE_VERTEX_BIT,
+        0,
+        sizeof(PushConstants),
+        &pushConstants);
+
+    vkCmdDraw(
+        commandBuffer,
+        static_cast<uint32_t>(pointVertices.size()),
+        1,
+        0,
+        0);
 
     vkCmdEndRenderPass(commandBuffer);
 
     if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS)
         throw std::runtime_error("failed to record command buffer!");
     // else
-        // LOG("recorded command buffer!"); //spams the log
+    // LOG("recorded command buffer!"); //spams the log
 }
 
 void Renderer::createSyncObjects()
@@ -982,7 +1225,7 @@ std::vector<const char *> Renderer::getRequiredExtensions()
 
     // If validation is enabled, add extension to report validation debug info
     if (enableValidationLayers)
-         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
     return extensions;
 }

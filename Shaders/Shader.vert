@@ -1,22 +1,27 @@
 #version 450
 
+// Data received from the Vulkan vertex buffer.
+layout(location = 0) in vec3 inPosition;
+layout(location = 1) in vec3 inColor;
+
+// Data sent to the fragment shader.
 layout(location = 0) out vec3 fragColor;
 
-vec3 positions[3] = vec3[](
-    //    x ,   y  , z
-    vec3(0.0, -0.5, 0.0),
-    vec3(0.5, 0.5, 0.0),
-    vec3(-0.5, 0.5, 0.0)
-);
+// Camera transformation supplied by Renderer.cpp.
+layout(push_constant) uniform PushConstants
+{
+    mat4 viewProjection;
+} pushConstants;
 
-vec3 colors[3] = vec3[](
-    //    r ,  g ,  b
-    vec3(1.0, 0.0, 0.0),
-    vec3(0.0, 1.0, 0.0),
-    vec3(0.0, 0.0, 1.0)
-);
+void main()
+{
+    gl_Position =
+        pushConstants.viewProjection *
+        vec4(inPosition, 1.0);
 
-void main() {
-    gl_Position = vec4(positions[gl_VertexIndex], 1.0); // the last parameter is the w-component (homogeneous coordinates).
-    fragColor = colors[gl_VertexIndex];
+    // One-pixel point size works without requiring
+    // the Vulkan largePoints device feature.
+    gl_PointSize = 1.0;
+
+    fragColor = inColor;
 }
