@@ -20,6 +20,7 @@
 #include <limits>
 #include "Logger.h"
 #include "MainWindow.h"
+#include "unordered_map"
 
 #ifdef _WIN32			// Windows specific includes
 #define NOMINMAX		// Prevent Windows.h from defining min/max macros
@@ -81,6 +82,11 @@ void Renderer::initVulkan()
     pickPhysicalDevice();
     createLogicalDevice();
     loadPointCloud(PATH + "laz_text.txt");
+    constructRegularTriangulation(150, 150); //Convert the normalized point cloud into a regular grid of 150 x150
+    calculateTriangleNeighbours();// calculates neighbouring triangles and save the lecture-note format.
+    saveTriangulation(PATH + "triangulation.txt");
+    createTriangleIndexBuffer();
+
     createPointVertexBuffer();
     createSwapChain();
     createImageViews();
@@ -166,6 +172,303 @@ void Renderer::loadPointCloud(const std::string& filename)
     LOGP("Loaded %u terrain points", static_cast<unsigned int>(pointVertices.size()));
 }
 
+void Renderer::constructRegularTriangulation(uint32_t gridWidth,uint32_t gridDepth)
+{
+    if (gridWidth < 2 || gridDepth < 2)
+        throw std::runtime_error("triangulation grid must be at least 2 by 2");
+
+    if (pointVertices.empty())
+        throw std::runtime_error("cannot triangulate an empty point cloud");
+
+    // Keep a copy because pointVertices will become the grid geometry.
+    const std::vector<PointVertex> sourcePoints = pointVertices;
+
+    float minX = std::numeric_limits<float>::max();
+    float minZ = std::numeric_limits<float>::max();
+    float maxX = std::numeric_limits<float>::lowest();
+    float maxZ = std::numeric_limits<float>::lowest();
+
+    for (const PointVertex& point : sourcePoints)
+    {
+        minX = std::min(minX, point.position.x);
+        minZ = std::min(minZ, point.position.z);
+        maxX = std::max(maxX, point.position.x);
+        maxZ = std::max(maxZ, point.position.z);
+    }
+
+    const float sizeX = maxX - minX;
+    const float sizeZ = maxZ - minZ;
+
+    if (sizeX <= 0.0f || sizeZ <= 0.0f)
+        throw std::runtime_error("point cloud has an invalid horizontal size");
+
+    struct GridCell
+    {
+        double heightSum = 0.0;
+        uint32_t pointCount = 0;
+    };
+
+    const std::size_t cellCount =static_cast<std::size_t>(gridWidth) * gridDepth;
+
+    std::vector<GridCell> cells(cellCount);
+
+    // Place every point into one regular grid cell.
+    for (const PointVertex& point : sourcePoints)
+    {
+        const float normalizedX =(point.position.x - minX) / sizeX;
+
+        const float normalizedZ =(point.position.z - minZ) / sizeZ;
+
+        uint32_t column = std::min(static_cast<uint32_t>(normalizedX * static_cast<float>(gridWidth)),gridWidth - 1);
+        uint32_t row = std::min(static_cast<uint32_t>(normalizedZ * static_cast<float>(gridDepth)),gridDepth - 1);
+
+        GridCell& cell =
+            cells[static_cast<std::size_t>(row) * gridWidth + column];
+
+        cell.heightSum += point.position.y;
+        ++cell.pointCount;
+    }
+
+    const uint32_t invalidIndex =std::numeric_limits<uint32_t>::max();
+
+    // Maps grid cells to indices in pointVertices.
+    std::vector<uint32_t> gridVertexIndices(
+        cellCount,
+        invalidIndex);
+
+    pointVertices.clear();
+    terrainTriangles.clear();
+    triangleIndices.clear();
+
+    const float cellSizeX =
+        sizeX / static_cast<float>(gridWidth);
+
+    const float cellSizeZ =
+        sizeZ / static_cast<float>(gridDepth);
+
+    // Create one vertex at the average height of every occupied cell.
+    for (uint32_t row = 0; row < gridDepth; ++row)
+    {
+        for (uint32_t column = 0; column < gridWidth; ++column)
+        {
+            const std::size_t cellIndex =
+                static_cast<std::size_t>(row) * gridWidth + column;
+
+            const GridCell& cell = cells[cellIndex];
+
+            if (cell.pointCount == 0)
+                continue;
+
+            const float averageHeight =
+                static_cast<float>(
+                    cell.heightSum /
+                    static_cast<double>(cell.pointCount));
+
+            PointVertex vertex{};
+
+            vertex.position = glm::vec3(
+                minX + (static_cast<float>(column) + 0.5f) * cellSizeX,
+                averageHeight,
+                minZ + (static_cast<float>(row) + 0.5f) * cellSizeZ);
+
+            // The input data is already normalized to approximately 20 units.
+            const float height =
+                glm::clamp(averageHeight / 20.0f, 0.0f, 1.0f);
+
+            vertex.color = glm::vec3(
+                0.10f + 0.80f * height,
+                0.35f + 0.55f * height,
+                0.95f - 0.70f * height);
+
+            gridVertexIndices[cellIndex] =
+                static_cast<uint32_t>(pointVertices.size());
+
+            pointVertices.push_back(vertex);
+        }
+    }
+
+    // Split every complete grid square into two triangles.
+    for (uint32_t row = 0; row + 1 < gridDepth; ++row)
+    {
+        for (uint32_t column = 0;
+             column + 1 < gridWidth;
+             ++column)
+        {
+            const uint32_t topLeft =
+                gridVertexIndices[
+                    static_cast<std::size_t>(row) * gridWidth +
+                    column];
+
+            const uint32_t topRight =
+                gridVertexIndices[
+                    static_cast<std::size_t>(row) * gridWidth +
+                    column + 1];
+
+            const uint32_t bottomLeft =
+                gridVertexIndices[
+                    static_cast<std::size_t>(row + 1) * gridWidth +
+                    column];
+
+            const uint32_t bottomRight =
+                gridVertexIndices[
+                    static_cast<std::size_t>(row + 1) * gridWidth +
+                    column + 1];
+
+            // Do not create triangles over missing terrain cells.
+            if (topLeft == invalidIndex ||
+                topRight == invalidIndex ||
+                bottomLeft == invalidIndex ||
+                bottomRight == invalidIndex)
+            {
+                continue;
+            }
+
+            TerrainTriangle first{};
+            first.vertices[0] = topLeft;
+            first.vertices[1] = bottomLeft;
+            first.vertices[2] = topRight;
+            terrainTriangles.push_back(first);
+
+            TerrainTriangle second{};
+            second.vertices[0] = topRight;
+            second.vertices[1] = bottomLeft;
+            second.vertices[2] = bottomRight;
+            terrainTriangles.push_back(second);
+        }
+    }
+
+    // Create the flat index list required by Vulkan.
+    triangleIndices.reserve(terrainTriangles.size() * 3);
+
+    for (const TerrainTriangle& triangle : terrainTriangles)
+    {
+        triangleIndices.push_back(triangle.vertices[0]);
+        triangleIndices.push_back(triangle.vertices[1]);
+        triangleIndices.push_back(triangle.vertices[2]);
+    }
+
+    if (terrainTriangles.empty())
+        throw std::runtime_error(
+            "regular triangulation produced no triangles");
+
+    LOGP(
+        "Regular triangulation: %u vertices",
+        static_cast<unsigned int>(pointVertices.size()));
+
+    LOGP(
+        "Regular triangulation: %u triangles",
+        static_cast<unsigned int>(terrainTriangles.size()));
+}
+
+void Renderer::calculateTriangleNeighbours()
+{
+    struct EdgeOwner
+    {
+        std::size_t triangleIndex;
+        uint32_t edgeIndex;
+    };
+
+    std::unordered_map<uint64_t, EdgeOwner> edgeOwners;
+
+    auto makeEdgeKey = [](uint32_t first, uint32_t second)
+    {
+        const uint32_t smaller = std::min(first, second);
+        const uint32_t larger = std::max(first, second);
+
+        return
+            (static_cast<uint64_t>(smaller) << 32) |
+            static_cast<uint64_t>(larger);
+    };
+
+    for (std::size_t triangleIndex = 0;
+         triangleIndex < terrainTriangles.size();
+         ++triangleIndex)
+    {
+        TerrainTriangle& triangle =
+            terrainTriangles[triangleIndex];
+
+        // Reset all neighbours to boundary values.
+        triangle.neighbours[0] = -1;
+        triangle.neighbours[1] = -1;
+        triangle.neighbours[2] = -1;
+
+        // Neighbour 0 is across the edge opposite vertex 0
+        // Neighbour 1 is across the edge opposite vertex 1
+        // Neighbour 2 is across the edge opposite vertex 2
+        const uint32_t edgeVertices[3][2] =
+            {
+                {triangle.vertices[1], triangle.vertices[2]},
+                {triangle.vertices[2], triangle.vertices[0]},
+                {triangle.vertices[0], triangle.vertices[1]}
+            };
+
+        for (uint32_t edgeIndex = 0;
+             edgeIndex < 3;
+             ++edgeIndex)
+        {
+            const uint64_t edgeKey = makeEdgeKey(
+                edgeVertices[edgeIndex][0],
+                edgeVertices[edgeIndex][1]);
+
+            const auto existingEdge =
+                edgeOwners.find(edgeKey);
+
+            if (existingEdge == edgeOwners.end())
+            {
+                edgeOwners.emplace(
+                    edgeKey,
+                    EdgeOwner{triangleIndex, edgeIndex});
+            }
+            else
+            {
+                const EdgeOwner owner = existingEdge->second;
+
+                triangle.neighbours[edgeIndex] =
+                    static_cast<int32_t>(owner.triangleIndex);
+
+                terrainTriangles[owner.triangleIndex]
+                    .neighbours[owner.edgeIndex] =
+                    static_cast<int32_t>(triangleIndex);
+            }
+        }
+    }
+
+    LOG("Calculated triangle neighbours");
+}
+
+void Renderer::saveTriangulation(
+    const std::string& filename)
+{
+    std::ofstream file(filename);
+
+    if (!file.is_open())
+        throw std::runtime_error(
+            "failed to create triangulation file: " + filename);
+
+    // triangle count
+    // vertex0 vertex1 vertex2 neighbour0 neighbour1 neighbour2
+    file << terrainTriangles.size() << '\n';
+
+    for (const TerrainTriangle& triangle : terrainTriangles)
+    {
+        file
+            << triangle.vertices[0] << ' '
+            << triangle.vertices[1] << ' '
+            << triangle.vertices[2] << ' '
+            << triangle.neighbours[0] << ' '
+            << triangle.neighbours[1] << ' '
+            << triangle.neighbours[2] << '\n';
+    }
+
+    if (!file)
+        throw std::runtime_error(
+            "failed while writing triangulation file: " + filename);
+
+    LOGP(
+        "Saved %u triangles to triangulation.txt",
+        static_cast<unsigned int>(terrainTriangles.size()));
+}
+
 void Renderer::createPointVertexBuffer()
 {
     if (pointVertices.empty())
@@ -187,6 +490,52 @@ void Renderer::createPointVertexBuffer()
 
     std::memcpy(mappedMemory, pointVertices.data(), static_cast<std::size_t>(bufferSize));
     vkUnmapMemory(device, pointVertexBufferMemory);
+}
+
+void Renderer::createTriangleIndexBuffer()
+{
+    if (triangleIndices.empty())
+        throw std::runtime_error(
+            "cannot create an empty triangle index buffer");
+
+    const VkDeviceSize bufferSize =
+        sizeof(uint32_t) *
+        static_cast<VkDeviceSize>(triangleIndices.size());
+
+    createBuffer(
+        bufferSize,
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        triangleIndexBuffer,
+        triangleIndexBufferMemory);
+
+    void* mappedMemory = nullptr;
+
+    if (vkMapMemory(
+            device,
+            triangleIndexBufferMemory,
+            0,
+            bufferSize,
+            0,
+            &mappedMemory) != VK_SUCCESS)
+    {
+        throw std::runtime_error(
+            "failed to map triangle index-buffer memory");
+    }
+
+    std::memcpy(
+        mappedMemory,
+        triangleIndices.data(),
+        static_cast<std::size_t>(bufferSize));
+
+    vkUnmapMemory(
+        device,
+        triangleIndexBufferMemory);
+
+    LOGP(
+        "Created index buffer with %u indices",
+        static_cast<unsigned int>(triangleIndices.size()));
 }
 
 void Renderer::createBuffer(
@@ -266,6 +615,12 @@ void Renderer::cleanup()
 
     if (pointVertexBufferMemory != VK_NULL_HANDLE)
         vkFreeMemory(device, pointVertexBufferMemory, nullptr);
+
+    if (triangleIndexBuffer != VK_NULL_HANDLE)
+        vkDestroyBuffer(device,triangleIndexBuffer,nullptr);
+
+    if (triangleIndexBufferMemory != VK_NULL_HANDLE)
+        vkFreeMemory(device,triangleIndexBufferMemory,nullptr);
 
     vkDestroyPipeline(device, graphicsPipeline, nullptr);
     vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
@@ -493,6 +848,8 @@ void Renderer::createLogicalDevice()
 
     VkPhysicalDeviceFeatures deviceFeatures{};
 
+    deviceFeatures.fillModeNonSolid = VK_TRUE;
+
     VkDeviceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 
@@ -696,7 +1053,7 @@ void Renderer::createGraphicsPipeline()
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
     inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     inputAssembly.primitiveRestartEnable = VK_FALSE;
 
     VkPipelineViewportStateCreateInfo viewportState{};
@@ -708,7 +1065,7 @@ void Renderer::createGraphicsPipeline()
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.depthClampEnable = VK_FALSE;
     rasterizer.rasterizerDiscardEnable = VK_FALSE;
-    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;  // VK_POLYGON_MODE_FILL, VK_POLYGON_MODE_LINE, VK_POLYGON_MODE_POINT
+    rasterizer.polygonMode = VK_POLYGON_MODE_LINE;
     rasterizer.lineWidth = 1.0f;                    // set to wider lines if using VK_POLYGON_MODE_LINE
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE; // VK_FRONT_FACE_COUNTER_CLOCKWISE
@@ -842,7 +1199,11 @@ void Renderer::createCommandBuffers()
         LOG("allocate command buffers!");
 }
 
-void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex)
+
+void Renderer::recordCommandBuffer(
+    VkCommandBuffer commandBuffer,
+    uint32_t imageIndex)
+
 {
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -883,6 +1244,8 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     VkDeviceSize offsets[] = {0};
     vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
 
+    vkCmdBindIndexBuffer(commandBuffer,triangleIndexBuffer,0,VK_INDEX_TYPE_UINT32);
+
     const float aspectRatio =
         static_cast<float>(swapChainExtent.width) /
         static_cast<float>(swapChainExtent.height);
@@ -917,10 +1280,11 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
         sizeof(PushConstants),
         &pushConstants);
 
-    vkCmdDraw(
+    vkCmdDrawIndexed(
         commandBuffer,
-        static_cast<uint32_t>(pointVertices.size()),
+        static_cast<uint32_t>(triangleIndices.size()),
         1,
+        0,
         0,
         0);
 

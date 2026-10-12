@@ -30,6 +30,13 @@ struct PointVertex
     getAttributeDescriptions();
 };
 
+// A neighbour value of -1 represents a boundary edge.
+struct TerrainTriangle
+{
+    uint32_t vertices[3]{};
+    int32_t neighbours[3]{-1, -1, -1};
+};
+
 // Camera matrix sent to the vertex shader.
 struct PushConstants
 {
@@ -92,11 +99,15 @@ private:
 
     bool framebufferResized = false;
 
-    // Terrain point-cloud data
+    // Terrain geometry generated from the point cloud
     std::vector<PointVertex> pointVertices;
+    std::vector<TerrainTriangle> terrainTriangles;
+    std::vector<uint32_t> triangleIndices;
 
     VkBuffer pointVertexBuffer = VK_NULL_HANDLE;
     VkDeviceMemory pointVertexBufferMemory = VK_NULL_HANDLE;
+    VkBuffer triangleIndexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory triangleIndexBufferMemory = VK_NULL_HANDLE;
 
     // Logger
     class Logger& mLogger;
@@ -117,9 +128,13 @@ private:
     void createCommandBuffers();
     void createSyncObjects();
 
-    // Point-cloud functions
+    // Terrain and triangulation functions
     void loadPointCloud(const std::string& filename);
+    void constructRegularTriangulation(uint32_t gridWidth, uint32_t gridDepth);
+    void calculateTriangleNeighbours();
+    void saveTriangulation(const std::string& filename);
     void createPointVertexBuffer();
+    void createTriangleIndexBuffer();
 
     void createBuffer(
         VkDeviceSize size,
